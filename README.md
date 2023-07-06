@@ -10,7 +10,7 @@ $ pypi install ip-pool
 # Usage:
 
   - wpuser -a [username]  : add user 
-  - wpuser -r [username]  : remoe user
+  - wpuser -r [username]  : remove user
   - wpuser -l             : show assigned
 
 
