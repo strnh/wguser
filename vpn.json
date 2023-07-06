@@ -1,0 +1,7 @@
+{
+  "ip_version": 4,
+  "network": "192.168.3.0/24",
+  "hostnames": {
+    "router": "192.168.3.1"
+  }
+}

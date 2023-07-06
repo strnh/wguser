@@ -1,0 +1,73 @@
+#!/bin/sh
+#
+# wguser --  add/remove server config and put client config 
+#
+# require: ip-pool (pypi)
+#
+#
+INSTALLDIR=`pwd`
+INTERFACE="wg0" # set interface name
+DBFILE="${INSTALLDIR}/vpn.json"
+SERVERINTCONF="$INSTALLDIR/$INTERFACE.conf"
+servertmpl=`cat $INSTALLDIR/servertmpl`
+
+##
+##
+usage() {
+ cat << EOUSAGE
+------
+Usage $0 -a username   -- add useraccount
+      $0 -r username   -- remove useraccout
+      $0 -l -- list user
+------
+EOUSAGE
+}
+##
+
+##
+ 
+while getopts a:r:l opts
+  do 
+    case $opts in
+       a) username=${OPTARG}  
+         pkey=`wg genkey`
+         pubkey=`echo ${pkey} | wg pubkey`
+         uip=`ip-pool --new-address ${username} ${DBFILE}`
+         pip=`echo ${uip} | sed 's/[0-9][0-9]$/32/g'` # if (!"10.x.x.x/8") ..
+          cat << PCONFIG > ${username}.conf
+[Interface]
+Address = ${pip} 
+PrivateKey = ${pkey}
+
+${servertmpl}
+PCONFIG
+         cat <<SCONFIG >> ${SERVERINTCONF} 
+[Peer]
+## ${username}
+PublicKey = ${pubkey}
+AllowedIPs = ${pip}
+SCONFIG
+
+          ip-pool --list-used {DBFILE}
+
+          ;;
+        
+       r) username=$OPTARG
+         ip-pool --release-address ${username} ${DBFILE}
+          
+          lbeg=`export username && cat ${SERVERINTCONF} | awk '{ if($0~ENVIRON["username"]) { print NR-1 } }' ` 
+          lend=$((lbeg+4)) 
+          sed "${lbeg},${lend}d" < ${SERVERINTCONF} > ${SERVERINTCONF}.new
+          mv ${SERVERINTCONF} ${SERVERINTCONF}.old
+          mv ${SERVERINTCONF}.new ${SERVERINTCONF}
+          ;;
+
+       l) 
+         ip-pool --list-used ${DBFILE}
+          ;;
+ 
+       *) usage  ;;
+    esac
+done;
+
+

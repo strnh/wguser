@@ -1,0 +1,4 @@
+[Peer]
+PublicKey = 4tTytGvYMoqc5Xod1T+eO0mSo1lNqRe/UDgp/5cUmVE=
+Endpoint = vpn.example.com:51835
+AllowedIPs = 192.168.3.1/32, 192.168.0.0/24
