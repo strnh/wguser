@@ -4,18 +4,43 @@
 #
 # require: ip-pool (pypi), wg (wireguard-tools)
 #
-# Data files (vpn.json, servertmpl, wg0.conf) are looked up in the
-# directory of this script. Set WGUSER_DIR to use another directory.
+# Settings are read from a config file (shell syntax, see
+# wguser.conf.example), searched in this order:
+#   -c FILE / --config FILE,  $WGUSER_CONF,  <script dir>/wguser.conf
+# Without a config file the defaults below are used.
 #
 set -eu
 umask 077  # configs contain private keys
 
-INSTALLDIR=${WGUSER_DIR:-$(cd "$(dirname "$0")" && pwd)}
-INTERFACE="wg0" # set interface name
-DBFILE="${INSTALLDIR}/vpn.json"
-SERVERINTCONF="${INSTALLDIR}/${INTERFACE}.conf"
-SERVERTMPL="${INSTALLDIR}/servertmpl"
 PROG=$(basename "$0")
+SCRIPTDIR=$(cd "$(dirname "$0")" && pwd)
+
+# load the config file and fill in defaults
+load_config() {
+  if [ -n "$conffile" ]; then
+    [ -f "$conffile" ] || die "config not found: $conffile"
+  elif [ -f "$SCRIPTDIR/wguser.conf" ]; then
+    conffile="$SCRIPTDIR/wguser.conf"
+  fi
+  if [ -n "$conffile" ]; then
+    case $conffile in */*) ;; *) conffile="./$conffile" ;; esac
+    # shellcheck disable=SC1090
+    . "$conffile"
+  fi
+
+  : "${INTERFACE:=wg0}"
+  : "${DATADIR:=${WGUSER_DIR:-$SCRIPTDIR}}"
+  : "${DBFILE:=$DATADIR/vpn.json}"
+  : "${SERVERINTCONF:=$DATADIR/$INTERFACE.conf}"
+  : "${SERVERTMPL:=$DATADIR/servertmpl}"
+  : "${CLIENTDIR:=.}"
+  : "${HANDSHAKE_TIMEOUT:=180}"
+
+  case $HANDSHAKE_TIMEOUT in
+    ''|*[!0-9]*) die "HANDSHAKE_TIMEOUT must be a number of seconds" ;;
+  esac
+  [ -d "$CLIENTDIR" ] || die "CLIENTDIR not found: $CLIENTDIR"
+}
 
 ##
 ##
@@ -28,6 +53,8 @@ Usage $PROG -a username   -- add useraccount
       $PROG -s, --status  -- show connected accounts and remote IP on $INTERFACE
       $PROG -p, --peers   -- all peers of $INTERFACE as TSV
       $PROG -m, --metrics -- statistics in Prometheus text format
+Options:
+      -c, --config FILE   -- config file (default: \$WGUSER_CONF or $SCRIPTDIR/wguser.conf)
 ------
 EOUSAGE
 }
@@ -59,7 +86,8 @@ add_user() {
   username=$1
   check_username "$username"
   peer_exists "$username" && die "user '$username' already exists"
-  [ -e "${username}.conf" ] && die "${username}.conf already exists in $(pwd)"
+  clientconf="${CLIENTDIR}/${username}.conf"
+  [ -e "$clientconf" ] && die "$clientconf already exists"
 
   pkey=$(wg genkey)
   pubkey=$(printf '%s\n' "$pkey" | wg pubkey)
@@ -70,7 +98,7 @@ add_user() {
     *)   pip="${uip%/*}/32" ;;
   esac
 
-  cat << PCONFIG > "${username}.conf"
+  cat << PCONFIG > "$clientconf"
 [Interface]
 Address = ${pip}
 PrivateKey = ${pkey}
@@ -86,7 +114,7 @@ PublicKey = ${pubkey}
 AllowedIPs = ${pip}
 SCONFIG
 
-  echo "client config: $(pwd)/${username}.conf"
+  echo "client config: $clientconf"
   ip-pool --list-used "$DBFILE"
 }
 
@@ -122,9 +150,9 @@ remove_user() {
 # usernames are taken from the server config ("(unknown)" if not found).
 # peers in the server config but not on the interface get loaded=0.
 # a peer is "connected" if its latest handshake is within WireGuard's
-# session lifetime (180s).
+# session lifetime (HANDSHAKE_TIMEOUT, default 180s).
 peer_table() {
-  awk -F '\t' -v OFS='\t' -v now="$(date +%s)" -v alive=180 '
+  awk -F '\t' -v OFS='\t' -v now="$(date +%s)" -v alive="$HANDSHAKE_TIMEOUT" '
     # 1st file: server config -> map PublicKey to "## username"
     FNR == NR {
       if ($0 ~ /^[[:space:]]*\[/) name = ""
@@ -181,7 +209,8 @@ show_metrics() {
     printf 'wguser_interface_up{interface="%s"} 0\n' "$INTERFACE"
     return
   fi
-  printf '%s\n' "$dump" | peer_table | awk -F '\t' -v ifname="$INTERFACE" '
+  printf '%s\n' "$dump" | peer_table \
+    | awk -F '\t' -v ifname="$INTERFACE" -v alive="$HANDSHAKE_TIMEOUT" '
     function m(name, v) {
       out[name] = out[name] sprintf("%s{interface=\"%s\",user=\"%s\",public_key=\"%s\"} %s\n",
                                     name, ifname, $1, $2, v)
@@ -197,7 +226,7 @@ show_metrics() {
       help["wguser_peer_receive_bytes_total"] = "counter Bytes received from the peer."
       help["wguser_peer_transmit_bytes_total"] = "counter Bytes sent to the peer."
       help["wguser_peer_latest_handshake_timestamp_seconds"] = "gauge Unix time of the latest handshake (0 = never)."
-      help["wguser_peer_connected"] = "gauge 1 if the latest handshake is within 180s."
+      help["wguser_peer_connected"] = "gauge 1 if the latest handshake is within " alive "s."
       print "# HELP wguser_interface_up 1 if the WireGuard interface could be read."
       print "# TYPE wguser_interface_up gauge"
       printf "wguser_interface_up{interface=\"%s\"} 1\n", ifname
@@ -218,19 +247,29 @@ show_metrics() {
 
 ##
 
-[ $# -gt 0 ] || { usage; exit 1; }
-check_files
-
-# long options -> short options
+# config file option and long options -> short options
+conffile=${WGUSER_CONF:-}
+want_conf=
 for arg; do
   shift
+  if [ -n "$want_conf" ]; then
+    conffile=$arg; want_conf=
+    continue
+  fi
   case $arg in
+    -c|--config) want_conf=1 ;;
+    --config=*)  conffile=${arg#--config=} ;;
     --status)  set -- "$@" -s ;;
     --peers)   set -- "$@" -p ;;
     --metrics) set -- "$@" -m ;;
     *)        set -- "$@" "$arg" ;;
   esac
 done
+[ -z "$want_conf" ] || die "option -c requires a config file"
+
+load_config
+[ $# -gt 0 ] || { usage; exit 1; }
+check_files
 
 while getopts a:r:lspm opts
   do
