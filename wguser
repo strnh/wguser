@@ -1,73 +1,172 @@
 #!/bin/sh
 #
-# wguser --  add/remove server config and put client config 
+# wguser --  add/remove server config and put client config
 #
-# require: ip-pool (pypi)
+# require: ip-pool (pypi), wg (wireguard-tools)
 #
+# Data files (vpn.json, servertmpl, wg0.conf) are looked up in the
+# directory of this script. Set WGUSER_DIR to use another directory.
 #
-INSTALLDIR=`pwd`
+set -eu
+umask 077  # configs contain private keys
+
+INSTALLDIR=${WGUSER_DIR:-$(cd "$(dirname "$0")" && pwd)}
 INTERFACE="wg0" # set interface name
 DBFILE="${INSTALLDIR}/vpn.json"
-SERVERINTCONF="$INSTALLDIR/$INTERFACE.conf"
-servertmpl=`cat $INSTALLDIR/servertmpl`
+SERVERINTCONF="${INSTALLDIR}/${INTERFACE}.conf"
+SERVERTMPL="${INSTALLDIR}/servertmpl"
+PROG=$(basename "$0")
 
 ##
 ##
 usage() {
  cat << EOUSAGE
 ------
-Usage $0 -a username   -- add useraccount
-      $0 -r username   -- remove useraccout
-      $0 -l -- list user
+Usage $PROG -a username   -- add useraccount
+      $PROG -r username   -- remove useraccount
+      $PROG -l            -- list user
+      $PROG -s, --status  -- show connected accounts and remote IP on $INTERFACE
 ------
 EOUSAGE
 }
-##
 
-##
- 
-while getopts a:r:l opts
-  do 
-    case $opts in
-       a) username=${OPTARG}  
-         pkey=`wg genkey`
-         pubkey=`echo ${pkey} | wg pubkey`
-         uip=`ip-pool --new-address ${username} ${DBFILE}`
-         pip=`echo ${uip} | sed 's/[0-9][0-9]$/32/g'` # if (!"10.x.x.x/8") ..
-          cat << PCONFIG > ${username}.conf
+die() {
+  echo "$PROG: $*" >&2
+  exit 1
+}
+
+check_files() {
+  for f in "$DBFILE" "$SERVERINTCONF" "$SERVERTMPL"; do
+    [ -f "$f" ] || die "not found: $f"
+  done
+}
+
+# username is used as a file name and as a marker in the server config
+check_username() {
+  case $1 in
+    ''|-*|*[!A-Za-z0-9_-]*)
+      die "invalid username '$1' (allowed: A-Z a-z 0-9 _ -, not starting with -)" ;;
+  esac
+}
+
+peer_exists() {
+  grep -Fqx "## $1" "$SERVERINTCONF"
+}
+
+add_user() {
+  username=$1
+  check_username "$username"
+  peer_exists "$username" && die "user '$username' already exists"
+  [ -e "${username}.conf" ] && die "${username}.conf already exists in $(pwd)"
+
+  pkey=$(wg genkey)
+  pubkey=$(printf '%s\n' "$pkey" | wg pubkey)
+  uip=$(ip-pool --new-address "$username" "$DBFILE")
+  [ -n "$uip" ] || die "ip-pool returned no address"
+  case $uip in
+    *:*) pip="${uip%/*}/128" ;;
+    *)   pip="${uip%/*}/32" ;;
+  esac
+
+  cat << PCONFIG > "${username}.conf"
 [Interface]
-Address = ${pip} 
+Address = ${pip}
 PrivateKey = ${pkey}
 
-${servertmpl}
+$(cat "$SERVERTMPL")
 PCONFIG
-         cat <<SCONFIG >> ${SERVERINTCONF} 
+
+  cat << SCONFIG >> "$SERVERINTCONF"
+
 [Peer]
 ## ${username}
 PublicKey = ${pubkey}
 AllowedIPs = ${pip}
 SCONFIG
 
-          ip-pool --list-used {DBFILE}
+  echo "client config: $(pwd)/${username}.conf"
+  ip-pool --list-used "$DBFILE"
+}
 
-          ;;
-        
-       r) username=$OPTARG
-         ip-pool --release-address ${username} ${DBFILE}
-          
-          lbeg=`export username && cat ${SERVERINTCONF} | awk '{ if($0~ENVIRON["username"]) { print NR-1 } }' ` 
-          lend=$((lbeg+4)) 
-          sed "${lbeg},${lend}d" < ${SERVERINTCONF} > ${SERVERINTCONF}.new
-          mv ${SERVERINTCONF} ${SERVERINTCONF}.old
-          mv ${SERVERINTCONF}.new ${SERVERINTCONF}
-          ;;
+remove_user() {
+  username=$1
+  check_username "$username"
+  peer_exists "$username" || die "user '$username' not found in $SERVERINTCONF"
 
-       l) 
-         ip-pool --list-used ${DBFILE}
-          ;;
- 
-       *) usage  ;;
+  # drop the whole [Peer] section (up to the next section header)
+  # that contains the line "## username"
+  tmp=$(mktemp "${SERVERINTCONF}.XXXXXX")
+  if ! awk -v marker="## $username" '
+      function flush(   i) {
+        if (!(ispeer && drop))
+          for (i = 1; i <= n; i++) print buf[i]
+        n = 0; drop = 0
+      }
+      /^[[:space:]]*\[/ { flush(); ispeer = ($0 ~ /^[[:space:]]*\[Peer\]/) }
+      { buf[++n] = $0; if ($0 == marker) drop = 1 }
+      END { flush() }
+    ' "$SERVERINTCONF" > "$tmp"; then
+    rm -f "$tmp"
+    die "failed to update $SERVERINTCONF"
+  fi
+  cp -p "$SERVERINTCONF" "${SERVERINTCONF}.old"
+  mv "$tmp" "$SERVERINTCONF"
+
+  ip-pool --release-address "$username" "$DBFILE"
+}
+
+# print connected accounts and their remote IP, from "wg show" of the interface.
+# a peer is "connected" if its latest handshake is within WireGuard's
+# session lifetime (180s). usernames are taken from the server config.
+show_status() {
+  dump=$(wg show "$INTERFACE" dump) \
+    || die "cannot read interface $INTERFACE (is it up? are you root?)"
+  printf '%s\n' "$dump" | awk -F '\t' -v now="$(date +%s)" -v alive=180 '
+    # 1st file: server config -> map PublicKey to "## username"
+    FNR == NR {
+      if ($0 ~ /^[[:space:]]*\[/) name = ""
+      else if ($0 ~ /^## /) name = substr($0, 4)
+      else if (name != "" && $0 ~ /^[[:space:]]*PublicKey[[:space:]]*=/) {
+        k = $0; sub(/^[^=]*=[[:space:]]*/, "", k); sub(/[[:space:]]+$/, "", k)
+        user[k] = name
+      }
+      next
+    }
+    FNR == 1 {
+      fmt = "%-16s %s\n"
+      printf fmt, "ACCOUNT", "REMOTE-IP"
+      next  # interface line
+    }
+    $3 != "(none)" && $5 > 0 && now - $5 <= alive {
+      ip = $3
+      sub(/:[0-9]+$/, "", ip)   # strip port
+      gsub(/[][]/, "", ip)      # [v6addr] -> v6addr
+      printf fmt, (($1 in user) ? user[$1] : "(unknown)"), ip
+    }
+  ' "$SERVERINTCONF" -
+}
+
+##
+
+[ $# -gt 0 ] || { usage; exit 1; }
+check_files
+
+# long options -> short options
+for arg; do
+  shift
+  case $arg in
+    --status) set -- "$@" -s ;;
+    *)        set -- "$@" "$arg" ;;
+  esac
+done
+
+while getopts a:r:ls opts
+  do
+    case $opts in
+       a) add_user "$OPTARG" ;;
+       r) remove_user "$OPTARG" ;;
+       l) ip-pool --list-used "$DBFILE" ;;
+       s) show_status ;;
+       *) usage; exit 1 ;;
     esac
-done;
-
-
+done
