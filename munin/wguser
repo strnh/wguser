@@ -1,0 +1,75 @@
+#!/bin/sh
+#
+# wguser -- munin plugin: WireGuard traffic per user and connected users
+#
+# Uses "wguser --peers", so usernames come from the wguser server config.
+#
+# Install:
+#   ln -s /path/to/munin/wguser /etc/munin/plugins/wguser
+#
+# Config (/etc/munin/plugin-conf.d/wguser):
+#   [wguser]
+#   user root
+#   env.WGUSER /path/to/wguser
+#   env.WGUSER_DIR /etc/wireguard   # optional, see wguser
+#
+#%# family=manual
+#%# capabilities=multigraph
+#
+set -eu
+
+WGUSER=${WGUSER:-wguser}
+mode=${1:-fetch}
+
+peers=$("$WGUSER" --peers) || exit 1
+
+# field names: u_<username> with chars other than [A-Za-z0-9_] replaced by "_"
+printf '%s\n' "$peers" | awk -F '\t' -v mode="$mode" '
+  $1 == "" { next }
+  { conn += $7 }
+  $1 == "(unknown)" { next }  # no stable field name
+  {
+    f = "u_" $1; gsub(/[^A-Za-z0-9_]/, "_", f)
+    n++; u[n] = $1; fn[n] = f; rx[n] = $5; tx[n] = $6; ld[n] = $8
+  }
+  END {
+    print "multigraph wguser_traffic"
+    if (mode == "config") {
+      print "graph_title WireGuard traffic per user"
+      print "graph_args --base 1000"
+      print "graph_vlabel bits in (-) / out (+) per ${graph_period}"
+      print "graph_category network"
+      print "graph_info in = received from the user, out = sent to the user"
+      for (i = 1; i <= n; i++) {
+        print fn[i] "_rx.label " u[i]
+        print fn[i] "_rx.type DERIVE"
+        print fn[i] "_rx.min 0"
+        print fn[i] "_rx.graph no"
+        print fn[i] "_rx.cdef " fn[i] "_rx,8,*"
+        print fn[i] "_tx.label " u[i]
+        print fn[i] "_tx.type DERIVE"
+        print fn[i] "_tx.min 0"
+        print fn[i] "_tx.negative " fn[i] "_rx"
+        print fn[i] "_tx.cdef " fn[i] "_tx,8,*"
+      }
+    } else {
+      for (i = 1; i <= n; i++) {
+        print fn[i] "_rx.value " (ld[i] ? rx[i] : "U")
+        print fn[i] "_tx.value " (ld[i] ? tx[i] : "U")
+      }
+    }
+
+    print "multigraph wguser_peers"
+    if (mode == "config") {
+      print "graph_title WireGuard connected users"
+      print "graph_args --base 1000 --lower-limit 0"
+      print "graph_vlabel users"
+      print "graph_category network"
+      print "connected.label connected"
+      print "connected.type GAUGE"
+      print "connected.info handshake within the last 180s"
+    } else {
+      print "connected.value " conn + 0
+    }
+  }
+'
