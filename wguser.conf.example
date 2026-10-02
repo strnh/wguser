@@ -1,0 +1,26 @@
+# wguser.conf -- settings for wguser (shell syntax, sourced by wguser)
+#
+# Copy to wguser.conf next to the wguser script, or point to it with
+# "wguser -c FILE" or the WGUSER_CONF environment variable.
+# All settings are optional; the values below are the defaults.
+
+# WireGuard interface name
+#INTERFACE=wg0
+
+# directory holding the data files below (default: directory of the script)
+#DATADIR=/etc/wireguard
+
+# ip-pool database
+#DBFILE=$DATADIR/vpn.json
+
+# server interface config, peers are added to / removed from it
+#SERVERINTCONF=$DATADIR/$INTERFACE.conf
+
+# [Peer] section appended to every client config
+#SERVERTMPL=$DATADIR/servertmpl
+
+# where client configs (<username>.conf) are written
+#CLIENTDIR=.
+
+# a peer counts as connected if its latest handshake is within this many seconds
+#HANDSHAKE_TIMEOUT=180

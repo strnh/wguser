@@ -18,8 +18,31 @@ $ pip install ip-pool
   - wguser -p, --peers    : all peers of wg0 as TSV (needs root)
   - wguser -m, --metrics  : statistics in Prometheus text format (needs root)
 
-`vpn.json`, `servertmpl` and `wg0.conf` are read from the directory of the script
-(override with `WGUSER_DIR=/path/to/dir`).
+# Configuration
+
+Settings are read from a config file in shell syntax (see `wguser.conf.example`),
+searched in this order:
+
+ 1. `wguser -c FILE` / `--config FILE`
+ 2. `WGUSER_CONF` environment variable
+ 3. `wguser.conf` in the directory of the script
+
+Without a config file the defaults are used: interface `wg0`, data files
+(`vpn.json`, `servertmpl`, `wg0.conf`) in the directory of the script,
+client configs written to the current directory.
+
+| Setting | Default | |
+|---|---|---|
+| `INTERFACE` | `wg0` | WireGuard interface |
+| `DATADIR` | script directory | base directory of the data files |
+| `DBFILE` | `$DATADIR/vpn.json` | ip-pool database |
+| `SERVERINTCONF` | `$DATADIR/$INTERFACE.conf` | server config |
+| `SERVERTMPL` | `$DATADIR/servertmpl` | `[Peer]` section for client configs |
+| `CLIENTDIR` | `.` | output directory of client configs |
+| `HANDSHAKE_TIMEOUT` | `180` | seconds; newer handshake = connected |
+
+The config file is sourced as a shell script, so keep it owned by root.
+
 Changes to `wg0.conf` are not applied to the running interface; reload it yourself, e.g.
 <pre>
 # wg syncconf wg0 <(wg-quick strip wg0)
@@ -28,7 +51,7 @@ Usernames may contain only `A-Z a-z 0-9 _ -`.
 
 # Statistics
 
-A peer is counted as connected if its latest handshake is within 180s.
+A peer is counted as connected if its latest handshake is within `HANDSHAKE_TIMEOUT` (180s).
 
 ## Prometheus (node_exporter textfile collector)
 <pre>
@@ -47,5 +70,6 @@ Metrics (labels: `interface`, `user`, `public_key`):
 [wguser]
 user root
 env.WGUSER /path/to/wguser
+env.WGUSER_CONF /path/to/wguser.conf
 </pre>
 Graphs: traffic per user (`wguser_traffic`), connected users (`wguser_peers`).

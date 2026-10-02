@@ -11,7 +11,7 @@
 #   [wguser]
 #   user root
 #   env.WGUSER /path/to/wguser
-#   env.WGUSER_DIR /etc/wireguard   # optional, see wguser
+#   env.WGUSER_CONF /etc/wireguard/wguser.conf   # optional, see wguser
 #
 #%# family=manual
 #%# capabilities=multigraph
@@ -67,7 +67,7 @@ printf '%s\n' "$peers" | awk -F '\t' -v mode="$mode" '
       print "graph_category network"
       print "connected.label connected"
       print "connected.type GAUGE"
-      print "connected.info handshake within the last 180s"
+      print "connected.info peers with a recent handshake (HANDSHAKE_TIMEOUT)"
     } else {
       print "connected.value " conn + 0
     }
