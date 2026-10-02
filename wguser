@@ -26,6 +26,8 @@ Usage $PROG -a username   -- add useraccount
       $PROG -r username   -- remove useraccount
       $PROG -l            -- list user
       $PROG -s, --status  -- show connected accounts and remote IP on $INTERFACE
+      $PROG -p, --peers   -- all peers of $INTERFACE as TSV
+      $PROG -m, --metrics -- statistics in Prometheus text format
 ------
 EOUSAGE
 }
@@ -115,35 +117,103 @@ remove_user() {
   ip-pool --release-address "$username" "$DBFILE"
 }
 
-# print connected accounts and their remote IP, from "wg show" of the interface.
+# read "wg show <if> dump" on stdin and print one line per peer (TSV):
+#   user public-key remote-ip latest-handshake rx-bytes tx-bytes connected loaded
+# usernames are taken from the server config ("(unknown)" if not found).
+# peers in the server config but not on the interface get loaded=0.
 # a peer is "connected" if its latest handshake is within WireGuard's
-# session lifetime (180s). usernames are taken from the server config.
-show_status() {
-  dump=$(wg show "$INTERFACE" dump) \
-    || die "cannot read interface $INTERFACE (is it up? are you root?)"
-  printf '%s\n' "$dump" | awk -F '\t' -v now="$(date +%s)" -v alive=180 '
+# session lifetime (180s).
+peer_table() {
+  awk -F '\t' -v OFS='\t' -v now="$(date +%s)" -v alive=180 '
     # 1st file: server config -> map PublicKey to "## username"
     FNR == NR {
       if ($0 ~ /^[[:space:]]*\[/) name = ""
       else if ($0 ~ /^## /) name = substr($0, 4)
       else if (name != "" && $0 ~ /^[[:space:]]*PublicKey[[:space:]]*=/) {
         k = $0; sub(/^[^=]*=[[:space:]]*/, "", k); sub(/[[:space:]]+$/, "", k)
-        user[k] = name
+        user[k] = name; order[++nu] = k
       }
       next
     }
-    FNR == 1 {
-      fmt = "%-16s %s\n"
-      printf fmt, "ACCOUNT", "REMOTE-IP"
-      next  # interface line
-    }
-    $3 != "(none)" && $5 > 0 && now - $5 <= alive {
+    FNR == 1 { next }  # interface line
+    {
+      seen[$1] = 1
       ip = $3
-      sub(/:[0-9]+$/, "", ip)   # strip port
-      gsub(/[][]/, "", ip)      # [v6addr] -> v6addr
-      printf fmt, (($1 in user) ? user[$1] : "(unknown)"), ip
+      if (ip == "(none)") ip = "-"
+      else {
+        sub(/:[0-9]+$/, "", ip)   # strip port
+        gsub(/[][]/, "", ip)      # [v6addr] -> v6addr
+      }
+      conn = ($5 > 0 && now - $5 <= alive) ? 1 : 0
+      print (($1 in user) ? user[$1] : "(unknown)"), $1, ip, $5, $6, $7, conn, 1
+    }
+    END {
+      for (i = 1; i <= nu; i++)
+        if (!(order[i] in seen))
+          print user[order[i]], order[i], "-", 0, 0, 0, 0, 0
     }
   ' "$SERVERINTCONF" -
+}
+
+wg_dump() {
+  wg show "$INTERFACE" dump
+}
+
+# connected accounts and their remote IP
+show_status() {
+  dump=$(wg_dump) || die "cannot read interface $INTERFACE (is it up? are you root?)"
+  printf '%-16s %s\n' "ACCOUNT" "REMOTE-IP"
+  printf '%s\n' "$dump" | peer_table \
+    | awk -F '\t' '$7 == 1 { printf "%-16s %s\n", $1, $3 }'
+}
+
+# all peers as TSV (see peer_table), for scripts and the munin plugin
+show_peers() {
+  dump=$(wg_dump) || die "cannot read interface $INTERFACE (is it up? are you root?)"
+  printf '%s\n' "$dump" | peer_table
+}
+
+# Prometheus text format, e.g. for node_exporter's textfile collector
+show_metrics() {
+  if ! dump=$(wg_dump 2>/dev/null); then
+    printf '# HELP wguser_interface_up 1 if the WireGuard interface could be read.\n'
+    printf '# TYPE wguser_interface_up gauge\n'
+    printf 'wguser_interface_up{interface="%s"} 0\n' "$INTERFACE"
+    return
+  fi
+  printf '%s\n' "$dump" | peer_table | awk -F '\t' -v ifname="$INTERFACE" '
+    function m(name, v) {
+      out[name] = out[name] sprintf("%s{interface=\"%s\",user=\"%s\",public_key=\"%s\"} %s\n",
+                                    name, ifname, $1, $2, v)
+    }
+    $8 == 1 {
+      m("wguser_peer_receive_bytes_total", $5)
+      m("wguser_peer_transmit_bytes_total", $6)
+      m("wguser_peer_latest_handshake_timestamp_seconds", $4)
+      m("wguser_peer_connected", $7)
+      conn += $7
+    }
+    END {
+      help["wguser_peer_receive_bytes_total"] = "counter Bytes received from the peer."
+      help["wguser_peer_transmit_bytes_total"] = "counter Bytes sent to the peer."
+      help["wguser_peer_latest_handshake_timestamp_seconds"] = "gauge Unix time of the latest handshake (0 = never)."
+      help["wguser_peer_connected"] = "gauge 1 if the latest handshake is within 180s."
+      print "# HELP wguser_interface_up 1 if the WireGuard interface could be read."
+      print "# TYPE wguser_interface_up gauge"
+      printf "wguser_interface_up{interface=\"%s\"} 1\n", ifname
+      print "# HELP wguser_connected_peers Number of connected peers."
+      print "# TYPE wguser_connected_peers gauge"
+      printf "wguser_connected_peers{interface=\"%s\"} %d\n", ifname, conn
+      split("wguser_peer_receive_bytes_total wguser_peer_transmit_bytes_total " \
+            "wguser_peer_latest_handshake_timestamp_seconds wguser_peer_connected", names, " ")
+      for (i = 1; i in names; i++) {
+        n = names[i]
+        if (!(n in out)) continue
+        t = help[n]; sub(/ .*/, "", t); h = help[n]; sub(/^[^ ]* /, "", h)
+        printf "# HELP %s %s\n# TYPE %s %s\n%s", n, h, n, t, out[n]
+      }
+    }
+  '
 }
 
 ##
@@ -155,18 +225,22 @@ check_files
 for arg; do
   shift
   case $arg in
-    --status) set -- "$@" -s ;;
+    --status)  set -- "$@" -s ;;
+    --peers)   set -- "$@" -p ;;
+    --metrics) set -- "$@" -m ;;
     *)        set -- "$@" "$arg" ;;
   esac
 done
 
-while getopts a:r:ls opts
+while getopts a:r:lspm opts
   do
     case $opts in
        a) add_user "$OPTARG" ;;
        r) remove_user "$OPTARG" ;;
        l) ip-pool --list-used "$DBFILE" ;;
        s) show_status ;;
+       p) show_peers ;;
+       m) show_metrics ;;
        *) usage; exit 1 ;;
     esac
 done
